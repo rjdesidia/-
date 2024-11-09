@@ -1,0 +1,196 @@
+'-- скрипт для компрессии аудио с помощью сайдчейна
+
+'-- ==== КОНФИГУРАЦИЯ (настройте по необходимости) ====
+
+'-- конфигурация на основе входов (альтернатива 1)
+dim inputMonitor           as string  = ""        'ID входа для мониторинга уровня громкости
+dim inputAdjust            as string  = ""        'ID входа для регулировки выходной громкости
+dim inputAdjustUnmutedOnly as boolean = false     'регулировать ли только немутированные входы
+
+'-- конфигурация на основе посылов (альтернатива 2)
+dim busMonitor1            as string  = "G"       'ID аудиошины для мониторинга уровня громкости
+dim busMonitor2            as string  = "G"        'ID аудиошины для мониторинга уровня громкости (дополнительная шина)
+dim busAdjust              as string  = "F"       'ID аудиошины для регулировки выходной громкости
+dim busAdjustInputs        as boolean = false     'регулировать входы, подключенные к шине, вместо самой шины
+dim busAdjustInputsExcl    as string  = ""        'список входов, исключенных из регулировки (разделён запятыми)
+dim busAdjustUnmutedOnly   as boolean = false     'регулировать ли только немутированные шины/входы
+
+'-- конфигурация громкости
+dim volumeThreshold        as integer = -36       'порог громкости входа в дБ FS   (-oo до 0)
+dim volumeFull             as integer = 100        'полный уровень громкости на выходе в процентах (0 до 100)
+dim volumeReduced          as integer = 60        'сниженный уровень громкости на выходе в процентах (0 до 100)
+
+'-- конфигурация времени
+dim timeSlice              as integer = 10        'интервал времени между итерациями скрипта (мс)
+dim timeAwaitOver          as integer = 20        'время выше порога до запуска плавного понижения громкости (мс)
+dim timeAwaitBelow         as integer = 350       'время ниже порога до запуска плавного увеличения громкости (мс)
+dim timeFadeDown           as integer = 50        'время на понижение громкости (мс)
+dim timeFadeUp             as integer = 500       'время на увеличение громкости (мс)
+
+'-- конфигурация отладки
+dim debug                  as boolean = false      'выводить ли отладочную информацию в консоль
+
+'-- ==== ВНУТРЕННЕЕ СОСТОЯНИЕ ====
+
+'-- внутреннее состояние
+dim mode                   as string  = "wait"    'текущий режим итерации
+dim volumeCurrent          as double  = -1        'текущий уровень громкости на выходе в процентах (от 0 до 100)
+dim timeAwaitBelowCount    as integer = 0         'счётчик времени выше порога
+dim timeAwaitOverCount     as integer = 0         'счётчик времени ниже порога
+
+'-- предварительное преобразование значений
+dim volumeThresholdAmp     as double  = 10 ^ (volumeThreshold / 20)
+
+'-- подготовка XML DOM дерева
+dim cfg as new System.Xml.XmlDocument
+
+'-- подготовка списка исключённых входов
+dim busAdjustInputsExclA() as string = busAdjustInputsExcl.Split(",")
+
+'-- использование фиксированной локали для парсинга чисел с плавающей точкой
+dim cultureInfo as System.Globalization.CultureInfo = System.Globalization.CultureInfo.CreateSpecificCulture("en-US")
+
+'-- вход в бесконечный цикл итераций
+do while true
+    '-- получение текущего статуса API vMix
+    dim xml as string = API.XML()
+    cfg.LoadXml(xml)
+
+    '-- определение необходимости работы (определяется по статусу мьюта входа или шины)
+    dim muted as boolean = true
+    if busMonitor1 <> "" and inputMonitor = "" then
+        dim muted1 as boolean = Convert.ToBoolean(cfg.SelectSingleNode("/vmix/audio/bus" & busMonitor1 & "/@muted").Value)
+        dim muted2 as boolean = true
+        if busMonitor2 <> "" then
+            muted2 = Convert.ToBoolean(cfg.SelectSingleNode("/vmix/audio/bus" & busMonitor2 & "/@muted").Value)
+        end if
+        muted = muted1 and muted2
+    elseif busMonitor1 = "" and inputMonitor <> "" then
+        muted = Convert.ToBoolean(cfg.SelectSingleNode("/vmix/inputs/input[@title = '" & inputMonitor & "']/@muted").Value)
+    end if
+    if muted then
+        '-- сброс текущего уровня громкости при отключении мьюта
+        if volumeCurrent >= 0 then
+            volumeCurrent = -1
+        end if
+        continue do
+    end if
+
+    '-- инициализация выходной громкости
+    if volumeCurrent < 0 then
+        volumeCurrent = volumeFull
+        if busAdjust <> "" and inputAdjust = "" then
+            if not busAdjustInputs then
+                '-- регулировка громкости шины напрямую
+                dim isMuted as boolean = Convert.ToBoolean(cfg.SelectSingleNode("/vmix/audio/bus" & busAdjust & "/@muted").Value)
+                if not isMuted or not busAdjustUnmutedOnly then
+                    API.Function("SetBus" & busAdjust & "Volume", Value := cint(volumeCurrent).ToString())
+                end if
+            else
+                '-- регулировка громкости входов, подключенных к шине
+                dim busInputs as XmlNodeList = cfg.SelectNodes("/vmix/inputs/input[@audiobusses]")
+                for each busInput as XmlNode in busInputs
+                    dim onBusses() as string = busInput.Attributes("audiobusses").Value.Split(",")
+                    dim title      as string = busInput.Attributes("title").Value
+                    if Array.IndexOf(onBusses, busAdjust) >= 0 and Array.IndexOf(busAdjustInputsExclA, title) < 0 then
+                        dim isMuted as boolean = Convert.ToBoolean(busInput.Attributes("muted").Value)
+                        if not isMuted or not busAdjustUnmutedOnly then
+                            dim num as integer = Convert.ToInt32(busInput.Attributes("number").Value)
+                            Input.Find(num).Function("SetVolume", Value := cint(volumeCurrent).ToString())
+                        end if
+                    end if
+                next
+            end if
+        elseif busAdjust = "" and inputAdjust <> "" then
+            '-- регулировка громкости входа напрямую
+            dim isMuted as boolean = Convert.ToBoolean(cfg.SelectSingleNode("/vmix/inputs/input[@title = '" & inputAdjust & "']/@muted").Value)
+            if not isMuted or not inputAdjustUnmutedOnly then
+                API.Function("SetVolume", Input := inputAdjust, Value := cint(volumeCurrent).ToString())
+            end if
+        end if
+    end if
+
+    '-- определение уровня входной громкости (в линейной шкале громкости)
+    dim meter1 as double = 0.0
+    dim meter2 as double = 0.0
+    if busMonitor1 <> "" and inputMonitor = "" then
+        dim meter11 = Convert.ToDouble(cfg.SelectSingleNode("/vmix/audio/bus" & busMonitor1 & "/@meterF1").Value, cultureInfo)
+        dim meter12 = Convert.ToDouble(cfg.SelectSingleNode("/vmix/audio/bus" & busMonitor1 & "/@meterF2").Value, cultureInfo)
+        dim meter21 = Convert.ToDouble(cfg.SelectSingleNode("/vmix/audio/bus" & busMonitor2 & "/@meterF1").Value, cultureInfo)
+        dim meter22 = Convert.ToDouble(cfg.SelectSingleNode("/vmix/audio/bus" & busMonitor2 & "/@meterF2").Value, cultureInfo)
+        meter1 = Math.min(meter11, meter12)
+        meter2 = Math.min(meter21, meter22)
+    elseif busMonitor1 = "" and inputMonitor <> "" then
+        meter1 = Convert.ToDouble(cfg.SelectSingleNode("/vmix/inputs/input[@title = '" & inputMonitor & "']/@meterF1").Value, cultureInfo)
+        meter2 = Convert.ToDouble(cfg.SelectSingleNode("/vmix/inputs/input[@title = '" & inputMonitor & "']/@meterF2").Value, cultureInfo)
+    end if
+    if meter1 < meter2 then
+        meter1 = meter2
+    end if
+
+    '-- отслеживание, находится ли уровень громкости входа выше или ниже порога
+    if meter1 > volumeThresholdAmp then
+        timeAwaitOverCount  += 1
+        timeAwaitBelowCount  = 0
+    else
+        timeAwaitBelowCount += 1
+        timeAwaitOverCount   = 0
+    end if
+
+    '-- определение текущего режима работы
+    dim modeNew as String = ""
+    if timeAwaitBelowCount >= cint(timeAwaitBelow / timeSlice) and volumeCurrent < volumeFull then
+        modeNew = "fade-up"
+    elseif timeAwaitOverCount >= cint(timeAwaitOver / timeSlice) and volumeCurrent > volumeReduced then
+        modeNew = "fade-down"
+    else
+        modeNew = "wait"
+    end if
+    if mode <> modeNew then
+        if debug then
+            Console.WriteLine("audio-sidechain: INFO: переключение на режим: " & modeNew)
+        end if
+        mode = modeNew
+    end if
+
+    '-- понижение/увеличение громкости на выходе
+    if mode = "fade-down" or mode = "fade-up" then
+        if mode = "fade-down" then
+            volumeCurrent -= ((volumeFull - volumeReduced) / timeFadeDown) * timeSlice
+        elseif mode = "fade-up" then
+            volumeCurrent += ((volumeFull - volumeReduced) / timeFadeUp  ) * timeSlice
+        end if
+        if busAdjust <> "" and inputAdjust = "" then
+            if not busAdjustInputs then
+                '-- регулировка громкости шины напрямую
+                dim isMuted as boolean = Convert.ToBoolean(cfg.SelectSingleNode("/vmix/audio/bus" & busAdjust & "/@muted").Value)
+                if not isMuted or not busAdjustUnmutedOnly then
+                    API.Function("SetBus" & busAdjust & "Volume", Value := cint(volumeCurrent).ToString())
+                end if
+            else
+                '-- регулировка громкости входов, подключенных к шине
+                dim busInputs as XmlNodeList = cfg.SelectNodes("/vmix/inputs/input[@audiobusses]")
+                for each busInput as XmlNode in busInputs
+                    dim onBusses() as string = busInput.Attributes("audiobusses").Value.Split(",")
+                    dim title      as string = busInput.Attributes("title").Value
+                    if Array.IndexOf(onBusses, busAdjust) >= 0 and Array.IndexOf(busAdjustInputsExclA, title) < 0 then
+                        dim isMuted as boolean = Convert.ToBoolean(busInput.Attributes("muted").Value)
+                        if not isMuted or not busAdjustUnmutedOnly then
+                            dim num as integer = Convert.ToInt32(busInput.Attributes("number").Value)
+                            Input.Find(num).Function("SetVolume", Value := cint(volumeCurrent).ToString())
+                        end if
+                    end if
+                next
+            end if
+        elseif busAdjust = "" and inputAdjust <> "" then
+            '-- регулировка громкости входа напрямую
+            dim isMuted as boolean = Convert.ToBoolean(cfg.SelectSingleNode("/vmix/inputs/input[@title = '" & inputAdjust & "']/@muted").Value)
+            if not isMuted or not inputAdjustUnmutedOnly then
+                API.Function("SetVolume", Input := inputAdjust, Value := cint(volumeCurrent).ToString())
+            end if
+        end if
+    end if
+
+    '-- ожидание до следующей итерации
+    sleep(timeSlice)
+loop
